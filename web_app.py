@@ -22,7 +22,8 @@ PORTS_PER_HUB = 16
 MAX_PARALLEL = HUB_COUNT * PORTS_PER_HUB  # format all inserted cards at once
 MAX_CONVERT_RETRIES = 3
 VERIFY_RETRIES = 3
-POLL_INTERVAL_SEC = 1.5
+POLL_INTERVAL_SEC = 0.4
+UI_POLL_MS = 400
 SD_SIZE_MIN_GB = 26.0
 SD_SIZE_MAX_GB = 32.5
 SKIP_DISKS = {"disk0", "disk1"}
@@ -166,6 +167,19 @@ def get_partition_scheme(disk_id: str) -> str:
     return "unknown"
 
 
+def disk_exists(disk_id: str) -> bool:
+    result = subprocess.run(["diskutil", "info", disk_id], capture_output=True, text=True)
+    text = (result.stdout + result.stderr).lower()
+    return result.returncode == 0 and "could not find" not in text and "not found" not in text
+
+
+def is_mbr_scheme(scheme: str) -> bool:
+    s = scheme.lower()
+    if "guid_partition_scheme" in s:
+        return False
+    return "fdisk_partition_scheme" in s or "master boot record" in s
+
+
 def is_mbr_formatted(disk_id: str) -> bool:
     scheme = get_partition_scheme(disk_id).lower()
     if "guid_partition_scheme" in scheme:
@@ -204,7 +218,7 @@ def convert_to_mbr(disk_id: str) -> Tuple[bool, str]:
             continue
 
         for verify in range(VERIFY_RETRIES):
-            time.sleep(0.5 + verify * 0.3)
+            time.sleep(0.3 + verify * 0.2)
             if is_mbr_formatted(disk_id):
                 after = get_partition_scheme(disk_id)
                 lines.append(f"{disk_id}: after = {after}")
@@ -302,9 +316,21 @@ class Manager:
 
     def _clear_slot(self, key: Tuple[int, int]) -> None:
         info = self.slots[key]
-        if info.disk_id and info.disk_id in self.disk_to_slot:
-            del self.disk_to_slot[info.disk_id]
+        if info.disk_id:
+            self.failed_attempts.pop(info.disk_id, None)
+            self.processing.discard(info.disk_id)
+            if info.disk_id in self.disk_to_slot:
+                del self.disk_to_slot[info.disk_id]
         self.slots[key] = SlotInfo()
+
+    def _clear_removed_disks(self, present_ids: Set[str]) -> None:
+        """Clear any slot whose disk is gone (fixes red/green stuck after eject)."""
+        for key, info in list(self.slots.items()):
+            if not info.disk_id:
+                continue
+            if info.disk_id not in present_ids or not disk_exists(info.disk_id):
+                self.log(f"{info.disk_id}: ejected — slot cleared")
+                self._clear_slot(key)
 
     def _claim_disk(self, disk_id: str) -> bool:
         """Reserve disk for conversion (prevents duplicate workers on same card)."""
@@ -328,6 +354,10 @@ class Manager:
             self._release_disk(disk_id)
             return
         try:
+            if not disk_exists(disk_id):
+                self._clear_slot(key)
+                return
+
             if is_mbr_formatted(disk_id):
                 self._set_slot(key, SlotStatus.READY, disk_id, "MBR OK")
                 self.log(f"{disk_id}: already MBR - green")
@@ -336,13 +366,22 @@ class Manager:
             self._set_slot(key, SlotStatus.PROCESSING, disk_id, "format...")
             self.log(f"{disk_id}: parallel convert GPT -> MBR...")
             ok, detail = convert_to_mbr(disk_id)
+
+            if not disk_exists(disk_id):
+                self._clear_slot(key)
+                self.log(f"{disk_id}: ejected during format — slot cleared")
+                return
+
             if ok and is_mbr_formatted(disk_id):
                 self._set_slot(key, SlotStatus.READY, disk_id, "MBR OK")
                 self.failed_attempts.pop(disk_id, None)
                 self.log(f"{disk_id}: MBR SUCCESS - green\n{detail}")
             else:
-                self._set_slot(key, SlotStatus.FAILED, disk_id, "failed")
-                self.log(f"{disk_id}: FAILED\n{detail}")
+                if disk_exists(disk_id):
+                    self._set_slot(key, SlotStatus.FAILED, disk_id, "failed")
+                    self.log(f"{disk_id}: FAILED\n{detail}")
+                else:
+                    self._clear_slot(key)
         finally:
             self._release_disk(disk_id)
 
@@ -351,34 +390,37 @@ class Manager:
             try:
                 disks = parse_sd_disks(get_disks_output())
                 present_ids = {d.disk_id for d in disks}
+                disk_by_id = {d.disk_id: d for d in disks}
                 to_process: List[str] = []
 
                 with self.lock:
-                    for disk_id in [d for d in list(self.disk_to_slot) if d not in present_ids]:
-                        key = self.disk_to_slot.get(disk_id)
-                        if key:
-                            self.log(f"{disk_id}: removed - slot cleared")
-                            self._clear_slot(key)
+                    self._clear_removed_disks(present_ids)
 
                     for disk in disks:
                         if disk.disk_id in self.disk_to_slot:
                             key = self.disk_to_slot[disk.disk_id]
                             info = self.slots[key]
-                            if info.status == SlotStatus.READY and is_mbr_formatted(disk.disk_id):
+                            if info.status in (SlotStatus.READY, SlotStatus.PROCESSING):
+                                continue
+                            if info.status == SlotStatus.FAILED:
                                 continue
                             if info.status == SlotStatus.EMPTY:
-                                self._set_slot(key, SlotStatus.PENDING, disk.disk_id, disk.disk_id)
+                                if is_mbr_scheme(disk.scheme):
+                                    self._set_slot(key, SlotStatus.READY, disk.disk_id, "MBR OK")
+                                else:
+                                    self._set_slot(key, SlotStatus.PENDING, disk.disk_id, disk.disk_id)
                             continue
+
                         key = self._next_free_slot()
                         if key is None:
-                            self.log(f"{disk.disk_id}: no free slot")
                             continue
-                        if is_mbr_formatted(disk.disk_id):
+
+                        if is_mbr_scheme(disk.scheme):
                             self._set_slot(key, SlotStatus.READY, disk.disk_id, "MBR OK")
-                            self.log(f"{disk.disk_id}: inserted - already MBR")
+                            self.log(f"{disk.disk_id}: inserted — already MBR")
                         else:
                             self._set_slot(key, SlotStatus.PENDING, disk.disk_id, disk.disk_id)
-                            self.log(f"{disk.disk_id}: inserted - GPT (yellow)")
+                            self.log(f"{disk.disk_id}: inserted — GPT (yellow)")
 
                     for disk_id, key in list(self.disk_to_slot.items()):
                         if disk_id not in present_ids:
@@ -388,16 +430,16 @@ class Manager:
                             continue
                         if info.status == SlotStatus.PENDING:
                             to_process.append(disk_id)
-                        elif info.status == SlotStatus.FAILED and not is_mbr_formatted(disk_id):
-                            attempts = self.failed_attempts.get(disk_id, 0)
-                            if attempts < MAX_CONVERT_RETRIES:
-                                self.failed_attempts[disk_id] = attempts + 1
-                                info.status = SlotStatus.PENDING
-                                info.detail = "retry"
-                                to_process.append(disk_id)
+                        elif info.status == SlotStatus.FAILED:
+                            d = disk_by_id.get(disk_id)
+                            if d and not is_mbr_scheme(d.scheme):
+                                attempts = self.failed_attempts.get(disk_id, 0)
+                                if attempts < MAX_CONVERT_RETRIES:
+                                    self.failed_attempts[disk_id] = attempts + 1
+                                    info.status = SlotStatus.PENDING
+                                    info.detail = "retry"
+                                    to_process.append(disk_id)
 
-                if to_process:
-                    self.log(f"Starting parallel conversion for {len(to_process)} card(s): {', '.join(to_process)}")
                 for disk_id in to_process:
                     self._enqueue_disk(disk_id)
             except Exception as exc:
@@ -649,7 +691,7 @@ async function refresh() {{
 
 buildGrid();
 refresh();
-setInterval(refresh, 1500);
+setInterval(refresh, 400);
 </script>
 </body></html>
 """
