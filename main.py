@@ -31,6 +31,9 @@ COLOR_PENDING = "#FFC107"  # yellow — inserted, not MBR yet
 COLOR_PROCESSING = "#FF9800"
 COLOR_READY = "#4CAF50"  # green — MBR formatted
 COLOR_FAILED = "#F44336"
+APP_BG = "#F5F5F5"
+HUB_BG = "#ECEFF1"
+PANEL_BG = "#FFFFFF"
 
 # =========================
 # APP SETTINGS
@@ -38,51 +41,72 @@ COLOR_FAILED = "#F44336"
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
+ctk.set_widget_scaling(1.0)
+ctk.set_window_scaling(1.0)
 
 app = ctk.CTk()
-app.geometry("1200x820")
+app.geometry("1000x720")
+app.minsize(900, 640)
 app.title("AUTO SD CARD GPT -> MBR TOOL")
+app.configure(fg_color=APP_BG)
+
+# Solid root container — system Tk on Mac Mini breaks with transparent layers.
+root_frame = ctk.CTkFrame(app, fg_color=APP_BG, corner_radius=0)
+root_frame.pack(fill="both", expand=True)
 
 # =========================
-# BACKGROUND IMAGE
+# BACKGROUND IMAGE (optional, kept behind content)
 # =========================
 
 _bg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "background.jpg")
 if os.path.isfile(_bg_path):
-    bg_image = ctk.CTkImage(
-        light_image=Image.open(_bg_path),
-        dark_image=Image.open(_bg_path),
-        size=(1200, 820),
-    )
-    bg_label = ctk.CTkLabel(app, image=bg_image, text="")
-    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    try:
+        bg_image = ctk.CTkImage(
+            light_image=Image.open(_bg_path),
+            dark_image=Image.open(_bg_path),
+            size=(1000, 720),
+        )
+        bg_label = ctk.CTkLabel(root_frame, image=bg_image, text="")
+        bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    except Exception:
+        pass
 
 # =========================
 # UI
 # =========================
 
 title = ctk.CTkLabel(
-    app,
+    root_frame,
     text="AUTO SD CARD MANAGER",
-    font=("Arial", 28, "bold"),
+    font=("Helvetica", 26, "bold"),
     fg_color="#1976D2",
     corner_radius=12,
     text_color="#FFFFFF",
-    width=520,
-    height=48,
+    width=480,
+    height=46,
 )
-title.pack(pady=(14, 8))
+title.pack(pady=(12, 6))
 
 status_label = ctk.CTkLabel(
-    app,
+    root_frame,
     text="Watching for SD cards…",
-    font=("Arial", 14),
-    text_color="#333333",
+    font=("Helvetica", 13),
+    fg_color=APP_BG,
+    text_color="#212121",
 )
-status_label.pack(pady=(0, 6))
+status_label.pack(pady=(0, 4))
 
-hubs_frame = ctk.CTkFrame(app, fg_color="transparent")
-hubs_frame.pack(padx=16, pady=4, fill="x")
+legend = ctk.CTkLabel(
+    root_frame,
+    text="Gray = empty   Yellow = GPT inserted   Orange = formatting   Green = MBR ready   Red = failed",
+    font=("Helvetica", 11),
+    fg_color=APP_BG,
+    text_color="#455A64",
+)
+legend.pack(pady=(0, 6))
+
+hubs_frame = ctk.CTkFrame(root_frame, fg_color=PANEL_BG, corner_radius=10)
+hubs_frame.pack(padx=12, pady=4, fill="both", expand=True)
 
 slot_widgets: Dict[Tuple[int, int], ctk.CTkButton] = {}
 slot_labels: Dict[Tuple[int, int], ctk.CTkLabel] = {}
@@ -93,37 +117,38 @@ def _slot_key(hub: int, port: int) -> Tuple[int, int]:
 
 
 for hub_idx in range(1, HUB_COUNT + 1):
-    hub_col = ctk.CTkFrame(hubs_frame, corner_radius=10, fg_color="#ECEFF1")
-    hub_col.pack(side="left", expand=True, fill="both", padx=6)
+    hub_col = ctk.CTkFrame(hubs_frame, corner_radius=8, fg_color=HUB_BG)
+    hub_col.pack(side="left", expand=True, fill="both", padx=4, pady=6)
 
     ctk.CTkLabel(
         hub_col,
         text=f"HUB {hub_idx}",
-        font=("Arial", 16, "bold"),
+        font=("Helvetica", 15, "bold"),
+        fg_color=HUB_BG,
         text_color="#1976D2",
-    ).pack(pady=(8, 4))
+    ).pack(pady=(6, 4))
 
-    ports_grid = ctk.CTkFrame(hub_col, fg_color="transparent")
-    ports_grid.pack(padx=8, pady=(0, 8))
+    ports_grid = ctk.CTkFrame(hub_col, fg_color=HUB_BG)
+    ports_grid.pack(padx=6, pady=(0, 6))
 
     for port_idx in range(1, PORTS_PER_HUB + 1):
         row = (port_idx - 1) // 4
         col = (port_idx - 1) % 4
         key = _slot_key(hub_idx, port_idx)
 
-        cell = ctk.CTkFrame(ports_grid, fg_color="transparent")
-        cell.grid(row=row, column=col, padx=3, pady=3)
+        cell = ctk.CTkFrame(ports_grid, fg_color=HUB_BG)
+        cell.grid(row=row, column=col, padx=2, pady=2)
 
         btn = ctk.CTkButton(
             cell,
             text=str(port_idx),
-            width=52,
-            height=36,
-            font=("Arial", 12, "bold"),
+            width=48,
+            height=32,
+            font=("Helvetica", 11, "bold"),
             fg_color=COLOR_EMPTY,
             hover_color=COLOR_EMPTY,
             text_color="#37474F",
-            corner_radius=8,
+            corner_radius=6,
             state="disabled",
         )
         btn.pack()
@@ -131,9 +156,10 @@ for hub_idx in range(1, HUB_COUNT + 1):
         lbl = ctk.CTkLabel(
             cell,
             text="—",
-            font=("Arial", 9),
+            font=("Helvetica", 8),
+            fg_color=HUB_BG,
             text_color="#607D8B",
-            width=52,
+            width=48,
         )
         lbl.pack()
 
@@ -141,22 +167,26 @@ for hub_idx in range(1, HUB_COUNT + 1):
         slot_labels[key] = lbl
 
 textbox = ctk.CTkTextbox(
-    app,
-    width=1120,
-    height=180,
-    font=("Consolas", 12),
+    root_frame,
+    width=960,
+    height=140,
+    font=("Menlo", 11),
     fg_color="#000000",
     text_color="#00FF00",
-    corner_radius=10,
+    corner_radius=8,
 )
-textbox.pack(pady=(8, 10), padx=16)
+textbox.pack(pady=(6, 10), padx=12)
 textbox.insert("end", "Application started.\n")
 textbox.insert("end", f"Platform: macOS ({sys.platform})\n")
 textbox.insert(
     "end",
-    f"Layout: {HUB_COUNT} hubs × {PORTS_PER_HUB} ports — yellow = GPT, green = verified MBR\n",
-    f"Command: diskutil eraseDisk FAT32 SDCARD MBRFormat diskN\n",
+    (
+        f"Layout: {HUB_COUNT} hubs x {PORTS_PER_HUB} ports\n"
+        f"Command: diskutil eraseDisk FAT32 SDCARD MBRFormat diskN\n"
+    ),
 )
+
+root_frame.lift()
 
 # =========================
 # DISK / MBR LOGIC
@@ -522,11 +552,22 @@ def on_close() -> None:
     app.destroy()
 
 
+def _force_layout() -> None:
+    """System Tk on Mac Mini sometimes needs a relayout pass to paint widgets."""
+    app.update_idletasks()
+    w, h = app.winfo_width(), app.winfo_height()
+    if w > 1 and h > 1:
+        app.geometry(f"{w}x{h}")
+    root_frame.lift()
+
+
 app.protocol("WM_DELETE_WINDOW", on_close)
 
 # Start background poller
 threading.Thread(target=poll_and_process, daemon=True).start()
 refresh_all_ui()
 update_status_bar()
+app.update_idletasks()
+app.after(200, _force_layout)
 
 app.mainloop()
