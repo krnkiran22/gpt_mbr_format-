@@ -4,7 +4,29 @@ import threading
 import re
 import os
 import sys
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Set, Tuple
+
 from PIL import Image
+
+# =========================
+# CONFIG
+# =========================
+
+HUB_COUNT = 3
+PORTS_PER_HUB = 16
+POLL_INTERVAL_SEC = 1.5
+SD_SIZE_MIN_GB = 26.0
+SD_SIZE_MAX_GB = 32.5
+SKIP_DISKS = {"disk0", "disk1"}
+
+COLOR_EMPTY = "#B0BEC5"
+COLOR_PENDING = "#FFC107"  # yellow — inserted, not MBR yet
+COLOR_PROCESSING = "#FF9800"
+COLOR_READY = "#4CAF50"  # green — MBR formatted
+COLOR_FAILED = "#F44336"
 
 # =========================
 # APP SETTINGS
@@ -14,12 +36,8 @@ ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
 app = ctk.CTk()
-app.geometry("900x650")
+app.geometry("1200x820")
 app.title("AUTO SD CARD GPT -> MBR TOOL")
-
-# =========================
-# BACKGROUND IMAGE
-# =========================
 
 # =========================
 # BACKGROUND IMAGE
@@ -30,76 +48,167 @@ if os.path.isfile(_bg_path):
     bg_image = ctk.CTkImage(
         light_image=Image.open(_bg_path),
         dark_image=Image.open(_bg_path),
-        size=(900, 650),
+        size=(1200, 820),
     )
-
-    bg_label = ctk.CTkLabel(
-        app,
-        image=bg_image,
-        text="",
-    )
-
-    bg_label.place(
-        relx=0,
-        rely=0,
-        relwidth=1,
-        relheight=1,
-    )
-
-    bg_label.place(x=0, y=0)
+    bg_label = ctk.CTkLabel(app, image=bg_image, text="")
+    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
 
 # =========================
-# TITLE
+# UI
 # =========================
 
 title = ctk.CTkLabel(
     app,
     text="AUTO SD CARD MANAGER",
-    font=("Arial", 30, "bold"),
+    font=("Arial", 28, "bold"),
     fg_color="#1976D2",
     corner_radius=12,
     text_color="white",
-    width=500,
-    height=50,
+    width=520,
+    height=48,
 )
+title.pack(pady=(14, 8))
 
-title.pack(pady=20)
+status_label = ctk.CTkLabel(
+    app,
+    text="Watching for SD cards…",
+    font=("Arial", 14),
+    text_color="#333333",
+)
+status_label.pack(pady=(0, 6))
 
-# =========================
-# TEXTBOX
-# =========================
+hubs_frame = ctk.CTkFrame(app, fg_color="transparent")
+hubs_frame.pack(padx=16, pady=4, fill="x")
+
+slot_widgets: Dict[Tuple[int, int], ctk.CTkButton] = {}
+slot_labels: Dict[Tuple[int, int], ctk.CTkLabel] = {}
+
+
+def _slot_key(hub: int, port: int) -> Tuple[int, int]:
+    return (hub, port)
+
+
+for hub_idx in range(1, HUB_COUNT + 1):
+    hub_col = ctk.CTkFrame(hubs_frame, corner_radius=10, fg_color="#ECEFF1")
+    hub_col.pack(side="left", expand=True, fill="both", padx=6)
+
+    ctk.CTkLabel(
+        hub_col,
+        text=f"HUB {hub_idx}",
+        font=("Arial", 16, "bold"),
+        text_color="#1976D2",
+    ).pack(pady=(8, 4))
+
+    ports_grid = ctk.CTkFrame(hub_col, fg_color="transparent")
+    ports_grid.pack(padx=8, pady=(0, 8))
+
+    for port_idx in range(1, PORTS_PER_HUB + 1):
+        row = (port_idx - 1) // 4
+        col = (port_idx - 1) % 4
+        key = _slot_key(hub_idx, port_idx)
+
+        cell = ctk.CTkFrame(ports_grid, fg_color="transparent")
+        cell.grid(row=row, column=col, padx=3, pady=3)
+
+        btn = ctk.CTkButton(
+            cell,
+            text=str(port_idx),
+            width=52,
+            height=36,
+            font=("Arial", 12, "bold"),
+            fg_color=COLOR_EMPTY,
+            hover_color=COLOR_EMPTY,
+            text_color="#37474F",
+            corner_radius=8,
+            state="disabled",
+        )
+        btn.pack()
+
+        lbl = ctk.CTkLabel(
+            cell,
+            text="—",
+            font=("Arial", 9),
+            text_color="#607D8B",
+            width=52,
+        )
+        lbl.pack()
+
+        slot_widgets[key] = btn
+        slot_labels[key] = lbl
 
 textbox = ctk.CTkTextbox(
     app,
-    width=760,
-    height=400,
-    font=("Consolas", 14),
+    width=1120,
+    height=180,
+    font=("Consolas", 12),
     fg_color="black",
     text_color="lime",
     corner_radius=10,
 )
-
-textbox.pack(pady=20)
-
-textbox.insert("end", "Application Started...\n")
+textbox.pack(pady=(8, 10), padx=16)
+textbox.insert("end", "Application started.\n")
 textbox.insert("end", f"Platform: macOS ({sys.platform})\n")
+textbox.insert(
+    "end",
+    f"Layout: {HUB_COUNT} hubs × {PORTS_PER_HUB} ports — yellow = needs MBR, green = MBR ready\n",
+)
 
 # =========================
-# GET DISKS (macOS diskutil)
+# DISK / MBR LOGIC
 # =========================
 
 
-def get_disks():
-    result = subprocess.run(
-        ["diskutil", "list"],
-        capture_output=True,
-        text=True,
+class SlotStatus(str, Enum):
+    EMPTY = "empty"
+    PENDING = "pending"  # inserted, GPT / not MBR
+    PROCESSING = "processing"
+    READY = "ready"  # verified MBR
+    FAILED = "failed"
+
+
+@dataclass
+class SlotInfo:
+    status: SlotStatus = SlotStatus.EMPTY
+    disk_id: Optional[str] = None
+    detail: str = "—"
+
+
+@dataclass
+class DiskInfo:
+    disk_id: str
+    size_gb: float
+    scheme: str  # GUID_partition_scheme, FDisk_partition_scheme, etc.
+
+
+@dataclass
+class AppState:
+    slots: Dict[Tuple[int, int], SlotInfo] = field(
+        default_factory=lambda: {
+            _slot_key(h, p): SlotInfo() for h in range(1, HUB_COUNT + 1) for p in range(1, PORTS_PER_HUB + 1)
+        }
     )
-    return result.stdout
+    disk_to_slot: Dict[str, Tuple[int, int]] = field(default_factory=dict)
+    processing: Set[str] = field(default_factory=set)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    poll_running: bool = True
 
 
-def _size_gb(line: str) -> float | None:
-    """Parse '*29.8 GB' style size from diskutil list line."""
+state = AppState()
+_log_lock = threading.Lock()
+
+
+def log(msg: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+
+    def _append() -> None:
+        with _log_lock:
+            textbox.insert("end", f"[{ts}] {msg}\n")
+            textbox.see("end")
+
+    app.after(0, _append)
+
+
+def _size_gb(line: str) -> Optional[float]:
     m = re.search(r"\*\s*([\d.]+)\s*GB", line, re.IGNORECASE)
     if m:
         return float(m.group(1))
@@ -109,14 +218,21 @@ def _size_gb(line: str) -> float | None:
     return None
 
 
-def detect_sd_disks(output: str) -> list[str]:
-    """
-    Find external ~29 GB SD cards (typical 32 GB cards report ~29–31 GB).
-    Returns disk identifiers like disk5, disk6 (not disk5s1).
-    """
-    detected: list[str] = []
-    current_disk: str | None = None
+def get_disks_output() -> str:
+    result = subprocess.run(
+        ["diskutil", "list"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout
+
+
+def parse_sd_disks(output: str) -> List[DiskInfo]:
+    """Find external ~29 GB SD cards and read partition scheme."""
+    found: List[DiskInfo] = []
+    current_disk: Optional[str] = None
     is_external = False
+    scheme = ""
 
     for line in output.splitlines():
         header = re.match(r"/dev/(disk\d+)\s+\(([^)]+)\):", line.strip())
@@ -124,136 +240,246 @@ def detect_sd_disks(output: str) -> list[str]:
             current_disk = header.group(1)
             flags = header.group(2).lower()
             is_external = "external" in flags and "physical" in flags
+            scheme = ""
             continue
 
-        if not current_disk or not is_external:
+        if not current_disk or not is_external or current_disk in SKIP_DISKS:
+            continue
+
+        stripped = line.strip()
+        if re.match(r"^\d+:", stripped):
+            parts = stripped.split()
+            if len(parts) >= 2:
+                scheme = parts[1]
             continue
 
         size_gb = _size_gb(line)
         if size_gb is None:
             continue
 
-        # Match Windows tool logic: ~29 GB removable SD cards
-        if 26.0 <= size_gb <= 32.5 and current_disk not in detected:
-            # Skip internal boot disk (usually disk0 / disk1)
-            if current_disk not in ("disk0", "disk1"):
-                detected.append(current_disk)
+        if SD_SIZE_MIN_GB <= size_gb <= SD_SIZE_MAX_GB:
+            if not any(d.disk_id == current_disk for d in found):
+                found.append(
+                    DiskInfo(
+                        disk_id=current_disk,
+                        size_gb=size_gb,
+                        scheme=scheme or "unknown",
+                    )
+                )
 
-    return detected
-
-
-# =========================
-# AUTO DETECT + CONVERT
-# =========================
-
-is_running = False
+    return found
 
 
-def auto_convert():
-    textbox.insert("end", "\nButton Clicked...\n")
+def is_mbr_formatted(disk_id: str) -> bool:
+    """True when disk uses Master Boot Record (FDisk) partition scheme."""
+    result = subprocess.run(
+        ["diskutil", "info", disk_id],
+        capture_output=True,
+        text=True,
+    )
+    text = result.stdout.lower()
+    if "fdisk_partition_scheme" in text:
+        return True
+    if "master boot record" in text:
+        return True
 
-    global is_running
+    listing = subprocess.run(
+        ["diskutil", "list", disk_id],
+        capture_output=True,
+        text=True,
+    ).stdout.lower()
+    return "fdisk_partition_scheme" in listing
 
-    if is_running:
+
+def convert_to_mbr(disk_id: str) -> Tuple[bool, str]:
+    """Erase disk and apply MBR partition map + FAT32 volume."""
+    result = subprocess.run(
+        ["diskutil", "eraseDisk", "MBRFormat", "SDCARD", disk_id],
+        capture_output=True,
+        text=True,
+    )
+    combined = (result.stdout + "\n" + result.stderr).strip()
+    ok = result.returncode == 0 or "finished erase on" in combined.lower()
+
+    if ok and is_mbr_formatted(disk_id):
+        return True, combined
+
+    if ok:
+        return False, combined + "\nVerify failed: partition scheme is not MBR."
+
+    return False, combined
+
+
+def _next_free_slot() -> Optional[Tuple[int, int]]:
+    for hub in range(1, HUB_COUNT + 1):
+        for port in range(1, PORTS_PER_HUB + 1):
+            key = _slot_key(hub, port)
+            if state.slots[key].status == SlotStatus.EMPTY:
+                return key
+    return None
+
+
+def _set_slot(key: Tuple[int, int], status: SlotStatus, disk_id: Optional[str], detail: str) -> None:
+    state.slots[key] = SlotInfo(status=status, disk_id=disk_id, detail=detail)
+    if disk_id:
+        state.disk_to_slot[disk_id] = key
+    app.after(0, lambda: refresh_slot_ui(key))
+
+
+def _clear_slot(key: Tuple[int, int]) -> None:
+    info = state.slots[key]
+    if info.disk_id and info.disk_id in state.disk_to_slot:
+        del state.disk_to_slot[info.disk_id]
+    state.slots[key] = SlotInfo()
+    app.after(0, lambda: refresh_slot_ui(key))
+
+
+def refresh_slot_ui(key: Tuple[int, int]) -> None:
+    info = state.slots[key]
+    btn = slot_widgets[key]
+    lbl = slot_labels[key]
+
+    color_map = {
+        SlotStatus.EMPTY: COLOR_EMPTY,
+        SlotStatus.PENDING: COLOR_PENDING,
+        SlotStatus.PROCESSING: COLOR_PROCESSING,
+        SlotStatus.READY: COLOR_READY,
+        SlotStatus.FAILED: COLOR_FAILED,
+    }
+    text_color = "white" if info.status != SlotStatus.EMPTY else "#37474F"
+
+    btn.configure(
+        fg_color=color_map[info.status],
+        hover_color=color_map[info.status],
+        text_color=text_color,
+    )
+    lbl.configure(text=info.detail[:12])
+
+
+def refresh_all_ui() -> None:
+    for key in state.slots:
+        refresh_slot_ui(key)
+
+
+def update_status_bar() -> None:
+    counts = {s: 0 for s in SlotStatus}
+    for info in state.slots.values():
+        counts[info.status] += 1
+
+    status_label.configure(
+        text=(
+            f"Auto-detect ON  |  "
+            f"Pending: {counts[SlotStatus.PENDING]}  "
+            f"Processing: {counts[SlotStatus.PROCESSING]}  "
+            f"Ready (MBR): {counts[SlotStatus.READY]}  "
+            f"Failed: {counts[SlotStatus.FAILED]}  "
+            f"Empty: {counts[SlotStatus.EMPTY]}"
+        )
+    )
+
+
+def process_disk(disk_id: str) -> None:
+    with state.lock:
+        if disk_id in state.processing:
+            return
+        state.processing.add(disk_id)
+
+    key = state.disk_to_slot.get(disk_id)
+    if not key:
+        state.processing.discard(disk_id)
         return
 
-    is_running = True
+    try:
+        if is_mbr_formatted(disk_id):
+            _set_slot(key, SlotStatus.READY, disk_id, disk_id)
+            log(f"{disk_id}: already MBR — green")
+            return
 
-    textbox.delete("1.0", "end")
+        _set_slot(key, SlotStatus.PROCESSING, disk_id, "format…")
+        log(f"{disk_id}: converting GPT → MBR…")
+        app.after(0, update_status_bar)
 
-    textbox.insert(
-        "end",
-        "========== AUTO DETECT STARTED ==========\n\n",
-    )
-
-    output = get_disks()
-
-    textbox.insert("end", output)
-
-    detected_disks = detect_sd_disks(output)
-
-    if not detected_disks:
-        textbox.insert(
-            "end",
-            "\nNo ~29 GB external SD cards detected.\n"
-            "Check USB hubs are connected and cards are inserted.\n",
-        )
-        textbox.insert(
-            "end",
-            "\n========== ALL PROCESS COMPLETED ==========\n",
-        )
-        is_running = False
-        return
-
-    textbox.insert(
-        "end",
-        f"\nDetected disks: {', '.join(detected_disks)}\n",
-    )
-
-    textbox.insert(
-        "end",
-        "\n========== PROCESS STARTED ==========\n",
-    )
-
-    for d in detected_disks:
-
-        textbox.insert(
-            "end",
-            f"\nProcessing {d}...\n",
-        )
-
-        # macOS equivalent of: clean + convert mbr
-        # Erases the whole disk and applies MBR partition scheme
-        result = subprocess.run(
-            ["diskutil", "eraseDisk", "MBRFormat", "SDCARD", d],
-            capture_output=True,
-            text=True,
-        )
-
-        combined = (result.stdout + result.stderr).lower()
-
-        if result.returncode == 0 or "finished erase" in combined:
-
-            textbox.insert(
-                "end",
-                f"{d} : GPT -> MBR SUCCESS\n",
-            )
-
+        ok, detail = convert_to_mbr(disk_id)
+        if ok:
+            _set_slot(key, SlotStatus.READY, disk_id, disk_id)
+            log(f"{disk_id}: MBR format SUCCESS — green")
         else:
-
-            textbox.insert(
-                "end",
-                f"{d} : FAILED\n{result.stdout}{result.stderr}\n",
-            )
-
-    textbox.insert(
-        "end",
-        "\n========== ALL PROCESS COMPLETED ==========\n",
-    )
-
-    is_running = False
+            _set_slot(key, SlotStatus.FAILED, disk_id, "failed")
+            log(f"{disk_id}: FAILED\n{detail}")
+    finally:
+        state.processing.discard(disk_id)
+        app.after(0, update_status_bar)
 
 
-btn = ctk.CTkButton(
-    app,
-    text="AUTO DETECT & CONVERT",
-    width=320,
-    height=55,
-    font=("Arial", 18, "bold"),
-    fg_color="#1976D2",
-    hover_color="#1565C0",
-    text_color="white",
-    corner_radius=12,
-    command=lambda: threading.Thread(
-        target=auto_convert,
-    ).start(),
-)
+def poll_and_process() -> None:
+    while state.poll_running:
+        try:
+            output = get_disks_output()
+            disks = parse_sd_disks(output)
+            present_ids = {d.disk_id for d in disks}
 
-btn.pack(pady=20)
+            with state.lock:
+                # Remove disks that were unplugged
+                removed = [did for did in list(state.disk_to_slot) if did not in present_ids]
+                for disk_id in removed:
+                    key = state.disk_to_slot.get(disk_id)
+                    if key:
+                        log(f"{disk_id}: removed — slot cleared")
+                        _clear_slot(key)
+
+                # Assign new disks
+                for disk in disks:
+                    if disk.disk_id in state.disk_to_slot:
+                        key = state.disk_to_slot[disk.disk_id]
+                        info = state.slots[key]
+                        if info.status == SlotStatus.READY and is_mbr_formatted(disk.disk_id):
+                            continue
+                        if info.status == SlotStatus.EMPTY:
+                            _set_slot(key, SlotStatus.PENDING, disk.disk_id, disk.disk_id)
+                        continue
+
+                    key = _next_free_slot()
+                    if key is None:
+                        log(f"{disk.disk_id}: no free slot (all {HUB_COUNT * PORTS_PER_HUB} ports full)")
+                        continue
+
+                    if is_mbr_formatted(disk.disk_id):
+                        _set_slot(key, SlotStatus.READY, disk.disk_id, disk.disk_id)
+                        log(f"{disk.disk_id}: inserted — already MBR (green)")
+                    else:
+                        _set_slot(key, SlotStatus.PENDING, disk.disk_id, disk.disk_id)
+                        log(f"{disk.disk_id}: inserted — GPT detected (yellow)")
+
+                # Queue conversion for pending disks
+                to_process = []
+                for disk_id, key in list(state.disk_to_slot.items()):
+                    if disk_id not in present_ids:
+                        continue
+                    info = state.slots[key]
+                    if info.status == SlotStatus.PENDING and disk_id not in state.processing:
+                        to_process.append(disk_id)
+
+            app.after(0, update_status_bar)
+
+            for disk_id in to_process:
+                threading.Thread(target=process_disk, args=(disk_id,), daemon=True).start()
+
+        except Exception as exc:
+            log(f"Poll error: {exc}")
+
+        time.sleep(POLL_INTERVAL_SEC)
 
 
-# =========================
-# RUN APP
-# =========================
+def on_close() -> None:
+    state.poll_running = False
+    app.destroy()
+
+
+app.protocol("WM_DELETE_WINDOW", on_close)
+
+# Start background poller
+threading.Thread(target=poll_and_process, daemon=True).start()
+refresh_all_ui()
+update_status_bar()
 
 app.mainloop()
