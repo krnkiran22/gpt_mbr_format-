@@ -4,8 +4,8 @@ Browser-based SD card GPT -> MBR tool for Mac Mini.
 System Tk 8.5 on macOS 26 renders a blank window — Safari UI always works.
 """
 import json
-import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -25,13 +25,46 @@ SKIP_DISKS = {"disk0", "disk1"}
 HOST = "127.0.0.1"
 PORT = 8765
 
-COLOR = {
-    "empty": "#B0BEC5",
-    "pending": "#FFC107",
-    "processing": "#FF9800",
-    "ready": "#4CAF50",
-    "failed": "#F44336",
+PORT_VISUAL = {
+    "empty": {"bg": "#f4f4f5", "border": "#e4e4e7", "text": "#a1a1aa", "glow": ""},
+    "pending": {"bg": "#eab308", "border": "#facc15", "text": "#422006", "glow": ""},
+    "processing": {"bg": "#eab308", "border": "#facc15", "text": "#422006", "glow": ""},
+    "ready": {
+        "bg": "#15803d",
+        "border": "#4ade80",
+        "text": "rgba(255,255,255,0.95)",
+        "glow": "0 0 0 1px rgba(34,197,94,0.25), 0 0 8px rgba(34,197,94,0.22)",
+    },
+    "failed": {
+        "bg": "#dc2626",
+        "border": "#f87171",
+        "text": "rgba(255,255,255,0.95)",
+        "glow": "0 0 0 1px rgba(220,38,38,0.25), 0 0 8px rgba(220,38,38,0.22)",
+    },
 }
+
+STATION_BY_MINI = {
+    1: 1, 2: 1, 3: 1,
+    4: 2, 5: 2, 6: 2,
+    7: 3, 8: 3, 9: 3,
+    10: 4, 11: 4,
+}
+
+
+def host_info() -> dict:
+    hostname = socket.gethostname().lower()
+    mini_num = 0
+    station_id = 0
+    m = re.search(r"ingest-mini-(\d+)", hostname)
+    if m:
+        mini_num = int(m.group(1))
+        station_id = STATION_BY_MINI.get(mini_num, 0)
+    return {
+        "hostname": hostname,
+        "mini_num": mini_num,
+        "station_id": station_id,
+        "hub_base": (mini_num - 1) * 3 if mini_num else 0,
+    }
 
 
 def _slot_key(hub: int, port: int) -> Tuple[int, int]:
@@ -181,29 +214,39 @@ class Manager:
     def status_json(self) -> dict:
         counts = {s.value: 0 for s in SlotStatus}
         slots_out = []
+        host = host_info()
         for hub in range(1, HUB_COUNT + 1):
             for port in range(1, PORTS_PER_HUB + 1):
                 info = self.slots[_slot_key(hub, port)]
                 counts[info.status.value] += 1
+                visual = PORT_VISUAL[info.status.value]
                 slots_out.append(
                     {
                         "hub": hub,
                         "port": port,
+                        "hub_label": host["hub_base"] + hub if host["hub_base"] else hub,
                         "status": info.status.value,
-                        "color": COLOR[info.status.value],
+                        "bg": visual["bg"],
+                        "border": visual["border"],
+                        "text": visual["text"],
+                        "glow": visual["glow"],
                         "detail": info.detail[:12],
+                        "pulse": info.status == SlotStatus.PROCESSING,
                     }
                 )
         with self._log_lock:
             logs = list(self.logs[-80:])
+        inserted = counts["pending"] + counts["processing"] + counts["ready"] + counts["failed"]
         return {
+            "host": host,
             "counts": counts,
             "slots": slots_out,
             "logs": logs,
+            "inserted": inserted,
             "summary": (
-                f"Auto-detect ON | Pending: {counts['pending']} | "
-                f"Processing: {counts['processing']} | Ready: {counts['ready']} | "
-                f"Failed: {counts['failed']} | Empty: {counts['empty']}"
+                f"Auto-detect ON  ·  {inserted} inserted  ·  "
+                f"{counts['ready']} MBR ready  ·  {counts['processing']} formatting  ·  "
+                f"{counts['pending']} GPT  ·  {counts['failed']} failed"
             ),
         }
 
@@ -301,82 +344,245 @@ class Manager:
 
 
 MANAGER = Manager()
+HOST_INFO = host_info()
 
-HTML_PAGE = """<!DOCTYPE html>
-<html><head>
+HTML_PAGE = f"""<!DOCTYPE html>
+<html lang="en"><head>
 <meta charset="utf-8">
-<title>AUTO SD CARD GPT -> MBR TOOL</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build.ai SD Format</title>
 <style>
-  * { box-sizing: border-box; }
-  body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 0; background: #f5f5f5; color: #212121; }
-  .header { background: #1976D2; color: #fff; text-align: center; padding: 14px; font-size: 24px; font-weight: bold; }
-  .status { padding: 10px 16px; font-size: 14px; }
-  .legend { padding: 0 16px 10px; font-size: 12px; color: #455A64; }
-  .hubs { display: flex; gap: 8px; padding: 0 12px 12px; }
-  .hub { flex: 1; background: #eceff1; border: 1px solid #cfd8dc; border-radius: 8px; padding: 8px; }
-  .hub h3 { margin: 4px 0 8px; color: #1976D2; text-align: center; }
-  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
-  .slot { text-align: center; }
-  .port {
-    border-radius: 6px; padding: 8px 0; font-weight: bold; font-size: 13px;
-    border: 2px solid rgba(0,0,0,0.1); min-height: 36px;
-  }
-  .detail { font-size: 9px; color: #607D8B; margin-top: 2px; min-height: 14px; }
-  .log {
-    margin: 0 12px 12px; background: #1b1b1b; color: #0f0;
-    font-family: Menlo, monospace; font-size: 11px;
-    padding: 10px; border-radius: 8px; height: 160px; overflow-y: auto; white-space: pre-wrap;
-  }
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  html, body {{ height: 100%; overflow: hidden; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    background: #ffffff; color: #09090b;
+    display: flex; flex-direction: column;
+  }}
+  .top {{ padding: 20px 24px 12px; text-align: center; flex-shrink: 0; }}
+  .brand {{ font-size: 18px; letter-spacing: -0.01em; margin-bottom: 6px; }}
+  .brand-strong {{ font-weight: 700; letter-spacing: 0.2em; }}
+  .brand-muted {{ font-weight: 400; color: #a1a1aa; }}
+  .stats {{
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
+    gap: 6px 8px; font-size: 11px; color: #71717a;
+  }}
+  .dot {{
+    width: 8px; height: 8px; border-radius: 50%; background: #16a34a;
+    box-shadow: 0 0 6px rgba(22,163,106,0.4); display: inline-block;
+  }}
+  .stat-val {{ color: #09090b; font-weight: 500; }}
+  .badges {{
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 10px;
+  }}
+  .badge {{
+    display: inline-flex; align-items: center; gap: 6px; min-height: 26px;
+    padding: 0 10px; border-radius: 6px; border: 1px solid #e4e4e7; background: #fafafa;
+  }}
+  .badge-label {{
+    font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; color: #71717a;
+  }}
+  .badge-val {{ font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }}
+  .station-bar {{
+    border-bottom: 1px solid #e4e4e7; padding: 6px 24px; text-align: center;
+    font-size: 11px; letter-spacing: 0.08em; font-weight: 600; color: #71717a;
+    flex-shrink: 0;
+  }}
+  .main {{
+    flex: 1; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; overflow: auto; padding: 16px 24px 8px;
+  }}
+  .mini-wrap {{
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+  }}
+  .mini-meta {{
+    display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700;
+    color: #333; letter-spacing: 0.5px;
+  }}
+  .mini-dot {{
+    width: 7px; height: 7px; border-radius: 50%; background: #16a34a;
+    box-shadow: 0 0 6px rgba(22,163,106,0.4);
+  }}
+  .hubs-row {{ display: flex; gap: 3px; align-items: flex-start; }}
+  .hub-strip {{ display: inline-flex; flex-direction: column; align-items: center; gap: 8px; }}
+  .hub-body {{
+    display: flex; flex-direction: column; background: #fafafa; border-radius: 8px;
+    padding: 8px 6px; position: relative;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
+    border: 1px solid #e4e4e7;
+  }}
+  .hub-body::after {{
+    content: ""; position: absolute; bottom: -6px; left: 50%; transform: translateX(-50%);
+    width: 22px; height: 6px; background: #fafafa; border-radius: 0 0 3px 3px;
+    border: 1px solid #e4e4e7; border-top: none;
+  }}
+  .port-col {{ display: flex; flex-direction: column; gap: 3px; }}
+  .port {{
+    width: 36px; height: 24px; border-radius: 4px; border: 1.75px solid #e4e4e7;
+    background: #f4f4f5; display: flex; align-items: center; justify-content: center;
+    position: relative; overflow: hidden; transition: all 0.2s ease;
+  }}
+  .port-num {{
+    font-size: 10px; font-weight: 700; line-height: 1; user-select: none; z-index: 2;
+    color: #a1a1aa;
+  }}
+  .port.pulse::before {{
+    content: ""; position: absolute; inset: 0; background: rgba(255,255,255,0.25);
+    animation: pulse 1.2s ease-in-out infinite; z-index: 1;
+  }}
+  @keyframes pulse {{ 0%,100% {{ opacity: 0.2; }} 50% {{ opacity: 0.7; }} }}
+  .hub-label {{
+    font-size: 14px; font-weight: 700; color: #71717a; text-align: center; user-select: none;
+  }}
+  .legend {{
+    margin-top: 14px; font-size: 10px; color: #a1a1aa; letter-spacing: 0.06em;
+    text-transform: uppercase; text-align: center;
+  }}
+  .legend span {{ margin: 0 8px; }}
+  .swatch {{
+    display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+    vertical-align: middle; margin-right: 4px; border: 1px solid rgba(0,0,0,0.08);
+  }}
+  .log-wrap {{
+    flex-shrink: 0; border-top: 1px solid #e4e4e7; background: #fafafa; padding: 10px 16px 14px;
+  }}
+  .log-title {{
+    font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+    color: #71717a; margin-bottom: 6px;
+  }}
+  .log {{
+    height: 120px; overflow-y: auto; background: #ffffff; border: 1px solid #e4e4e7;
+    border-radius: 6px; padding: 8px 10px; font-family: ui-monospace, Menlo, monospace;
+    font-size: 11px; line-height: 1.45; color: #52525b; white-space: pre-wrap;
+  }}
 </style>
 </head><body>
-<div class="header">AUTO SD CARD MANAGER</div>
-<div class="status" id="status">Loading...</div>
-<div class="legend">Gray=empty &nbsp; Yellow=GPT &nbsp; Orange=formatting &nbsp; Green=MBR ready &nbsp; Red=failed</div>
-<div class="hubs" id="hubs"></div>
-<div class="log" id="log"></div>
+  <div class="top">
+    <div class="brand">
+      <span class="brand-strong">BUILD AI</span>
+      <span class="brand-muted">SD CARD FORMAT</span>
+    </div>
+    <div class="stats" id="stats-row">
+      <span class="dot"></span>
+      <span>Auto-detect active</span>
+      <span>·</span>
+      <span id="host-label">{HOST_INFO['hostname'] or 'ingest-mini'}</span>
+    </div>
+    <div class="badges" id="badges"></div>
+  </div>
+
+  <div class="station-bar" id="station-bar">STATION -- · GPT → MBR</div>
+
+  <div class="main">
+    <div class="mini-wrap">
+      <div class="mini-meta">
+        <span class="mini-dot"></span>
+        <span id="mini-label">MINI --</span>
+      </div>
+      <div class="hubs-row" id="hubs"></div>
+      <div class="legend">
+        <span><i class="swatch" style="background:#f4f4f5"></i>Empty</span>
+        <span><i class="swatch" style="background:#eab308"></i>GPT / Formatting</span>
+        <span><i class="swatch" style="background:#15803d"></i>MBR Ready</span>
+        <span><i class="swatch" style="background:#dc2626"></i>Failed</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="log-wrap">
+    <div class="log-title">Activity Log</div>
+    <div class="log" id="log"></div>
+  </div>
+
 <script>
 const HUBS = 3, PORTS = 16;
 
-function buildGrid() {
+function buildGrid() {{
   const root = document.getElementById('hubs');
   root.innerHTML = '';
-  for (let h = 1; h <= HUBS; h++) {
-    const hub = document.createElement('div');
-    hub.className = 'hub';
-    hub.innerHTML = '<h3>HUB ' + h + '</h3><div class="grid" id="hub-' + h + '"></div>';
-    root.appendChild(hub);
-    const grid = hub.querySelector('.grid');
-    for (let p = 1; p <= PORTS; p++) {
-      const cell = document.createElement('div');
-      cell.className = 'slot';
-      cell.id = 'slot-' + h + '-' + p;
-      cell.innerHTML = '<div class="port">' + p + '</div><div class="detail">-</div>';
-      grid.appendChild(cell);
-    }
-  }
-}
+  for (let h = 1; h <= HUBS; h++) {{
+    const strip = document.createElement('div');
+    strip.className = 'hub-strip';
+    strip.id = 'hub-strip-' + h;
 
-async function refresh() {
-  try {
+    const body = document.createElement('div');
+    body.className = 'hub-body';
+    const col = document.createElement('div');
+    col.className = 'port-col';
+    col.id = 'hub-' + h;
+
+    for (let p = PORTS; p >= 1; p--) {{
+      const port = document.createElement('div');
+      port.className = 'port';
+      port.id = 'slot-' + h + '-' + p;
+      port.innerHTML = '<span class="port-num">' + p + '</span>';
+      col.appendChild(port);
+    }}
+
+    body.appendChild(col);
+    strip.appendChild(body);
+
+    const label = document.createElement('div');
+    label.className = 'hub-label';
+    label.id = 'hub-label-' + h;
+    label.textContent = String(h);
+    strip.appendChild(label);
+
+    root.appendChild(strip);
+  }}
+}}
+
+function renderBadges(data) {{
+  const c = data.counts;
+  const items = [
+    ['Inserted', c.pending + c.processing + c.ready + c.failed, '#09090b', '#fafafa', '#e4e4e7'],
+    ['GPT', c.pending, '#92400e', '#fff7ed', '#fdba74'],
+    ['Formatting', c.processing, '#92400e', '#fff7ed', '#fdba74'],
+    ['MBR Ready', c.ready, '#166534', '#f0fdf4', '#bbf7d0'],
+    ['Failed', c.failed, '#991b1b', '#fee2e2', '#fecaca'],
+  ];
+  document.getElementById('badges').innerHTML = items.map(([label, val, color, bg, border]) =>
+    '<div class="badge" style="background:' + bg + ';border-color:' + border + '">' +
+    '<span class="badge-label">' + label + '</span>' +
+    '<span class="badge-val" style="color:' + color + '">' + val + '</span></div>'
+  ).join('');
+}}
+
+async function refresh() {{
+  try {{
     const r = await fetch('/api/status');
     const data = await r.json();
-    document.getElementById('status').textContent = data.summary;
-    for (const s of data.slots) {
+
+    if (data.host) {{
+      const station = data.host.station_id ? 'STATION ' + data.host.station_id : 'STATION --';
+      document.getElementById('station-bar').textContent = station + ' · GPT → MBR AUTO FORMAT';
+      document.getElementById('mini-label').textContent =
+        data.host.mini_num ? ('MINI ' + data.host.mini_num) : data.host.hostname.toUpperCase();
+    }}
+
+    renderBadges(data);
+
+    for (const s of data.slots) {{
       const el = document.getElementById('slot-' + s.hub + '-' + s.port);
       if (!el) continue;
-      const port = el.querySelector('.port');
-      const detail = el.querySelector('.detail');
-      port.style.background = s.color;
-      port.style.color = (s.status === 'empty') ? '#37474F' : '#fff';
-      detail.textContent = s.detail;
-    }
+      el.style.background = s.bg;
+      el.style.borderColor = s.border;
+      el.style.boxShadow = s.glow || 'none';
+      el.classList.toggle('pulse', !!s.pulse);
+      const num = el.querySelector('.port-num');
+      if (num) num.style.color = s.text;
+      const hubLabel = document.getElementById('hub-label-' + s.hub);
+      if (hubLabel && s.hub_label) hubLabel.textContent = String(s.hub_label);
+    }}
+
     document.getElementById('log').textContent = data.logs.join('\\n');
     const logEl = document.getElementById('log');
     logEl.scrollTop = logEl.scrollHeight;
-  } catch (e) {
-    document.getElementById('status').textContent = 'Connection error - is the app running?';
-  }
-}
+  }} catch (e) {{
+    document.getElementById('log').textContent = 'Connection error — is ./run.sh still running?';
+  }}
+}}
 
 buildGrid();
 refresh();
