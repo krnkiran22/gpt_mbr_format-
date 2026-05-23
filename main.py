@@ -1,9 +1,13 @@
+import os
+import sys
+
+# macOS system Tk (Command Line Tools) lacks some named colors like "lime".
+os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
+
 import customtkinter as ctk
 import subprocess
 import threading
 import re
-import os
-import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -63,7 +67,7 @@ title = ctk.CTkLabel(
     font=("Arial", 28, "bold"),
     fg_color="#1976D2",
     corner_radius=12,
-    text_color="white",
+    text_color="#FFFFFF",
     width=520,
     height=48,
 )
@@ -141,8 +145,8 @@ textbox = ctk.CTkTextbox(
     width=1120,
     height=180,
     font=("Consolas", 12),
-    fg_color="black",
-    text_color="lime",
+    fg_color="#000000",
+    text_color="#00FF00",
     corner_radius=10,
 )
 textbox.pack(pady=(8, 10), padx=16)
@@ -389,7 +393,7 @@ def refresh_slot_ui(key: Tuple[int, int]) -> None:
         SlotStatus.READY: COLOR_READY,
         SlotStatus.FAILED: COLOR_FAILED,
     }
-    text_color = "white" if info.status != SlotStatus.EMPTY else "#37474F"
+    text_color = "#FFFFFF" if info.status != SlotStatus.EMPTY else "#37474F"
 
     btn.configure(
         fg_color=color_map[info.status],

@@ -16,4 +16,5 @@ source .venv/bin/activate
 pip install --upgrade pip -q
 pip install -r requirements.txt
 echo "Installed at $REPO_DIR"
-echo "Run: cd $REPO_DIR && source .venv/bin/activate && python main.py"
+chmod +x run.sh
+echo "Run: cd $REPO_DIR && ./run.sh"
