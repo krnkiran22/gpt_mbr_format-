@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +19,9 @@ from typing import Dict, List, Optional, Set, Tuple
 
 HUB_COUNT = 3
 PORTS_PER_HUB = 16
+MAX_PARALLEL = HUB_COUNT * PORTS_PER_HUB  # format all inserted cards at once
+MAX_CONVERT_RETRIES = 3
+VERIFY_RETRIES = 3
 POLL_INTERVAL_SEC = 1.5
 SD_SIZE_MIN_GB = 26.0
 SD_SIZE_MAX_GB = 32.5
@@ -166,25 +170,43 @@ def is_mbr_formatted(disk_id: str) -> bool:
 
 
 def convert_to_mbr(disk_id: str) -> Tuple[bool, str]:
+    """Erase to MBR+FAT32 with retries and post-verify (each disk runs independently)."""
     before = get_partition_scheme(disk_id)
     lines = [f"{disk_id}: before = {before}"]
-    result = subprocess.run(
-        ["diskutil", "eraseDisk", "FAT32", "SDCARD", "MBRFormat", disk_id],
-        capture_output=True,
-        text=True,
-    )
-    combined = (result.stdout + "\n" + result.stderr).strip()
-    ok = result.returncode == 0 and "finished erase on" in combined.lower()
-    if not ok:
-        lines.append(combined)
-        return False, "\n".join(lines)
-    time.sleep(0.5)
-    after = get_partition_scheme(disk_id)
-    lines.append(f"{disk_id}: after = {after}")
-    lines.append(combined)
+
     if is_mbr_formatted(disk_id):
+        lines.append(f"{disk_id}: already verified MBR")
         return True, "\n".join(lines)
-    return False, "\n".join(lines) + "\nVerify failed: still not MBR."
+
+    last_combined = ""
+    for attempt in range(1, MAX_CONVERT_RETRIES + 1):
+        lines.append(f"{disk_id}: convert attempt {attempt}/{MAX_CONVERT_RETRIES}")
+        result = subprocess.run(
+            ["diskutil", "eraseDisk", "FAT32", "SDCARD", "MBRFormat", disk_id],
+            capture_output=True,
+            text=True,
+        )
+        last_combined = (result.stdout + "\n" + result.stderr).strip()
+        cmd_ok = result.returncode == 0 and "finished erase on" in last_combined.lower()
+
+        if not cmd_ok:
+            lines.append(last_combined)
+            time.sleep(1.0)
+            continue
+
+        for verify in range(VERIFY_RETRIES):
+            time.sleep(0.5 + verify * 0.3)
+            if is_mbr_formatted(disk_id):
+                after = get_partition_scheme(disk_id)
+                lines.append(f"{disk_id}: after = {after}")
+                lines.append(last_combined)
+                lines.append(f"{disk_id}: MBR verified OK")
+                return True, "\n".join(lines)
+
+        lines.append(f"{disk_id}: verify failed after attempt {attempt}")
+
+    lines.append(last_combined)
+    return False, "\n".join(lines) + "\nVerify failed: still not MBR after retries."
 
 
 class Manager:
@@ -194,12 +216,15 @@ class Manager:
         }
         self.disk_to_slot: Dict[str, Tuple[int, int]] = {}
         self.processing: Set[str] = set()
+        self.failed_attempts: Dict[str, int] = {}
         self.lock = threading.Lock()
         self.poll_running = True
+        self.executor = ThreadPoolExecutor(max_workers=MAX_PARALLEL, thread_name_prefix="mbr")
         self.logs: List[str] = [
             "Application started (browser UI).",
             f"Platform: macOS ({sys.platform})",
             f"Layout: {HUB_COUNT} hubs x {PORTS_PER_HUB} ports",
+            f"Parallel workers: {MAX_PARALLEL} (all cards format at the same time)",
             "Command: diskutil eraseDisk FAT32 SDCARD MBRFormat diskN",
         ]
         self._log_lock = threading.Lock()
@@ -244,10 +269,13 @@ class Manager:
             "logs": logs,
             "inserted": inserted,
             "summary": (
-                f"Auto-detect ON  ·  {inserted} inserted  ·  "
+                f"Parallel format ON (max {MAX_PARALLEL})  ·  "
+                f"{len(self.processing)} active  ·  {inserted} inserted  ·  "
                 f"{counts['ready']} MBR ready  ·  {counts['processing']} formatting  ·  "
                 f"{counts['pending']} GPT  ·  {counts['failed']} failed"
             ),
+            "parallel_active": len(self.processing),
+            "parallel_max": MAX_PARALLEL,
         }
 
     def _next_free_slot(self) -> Optional[Tuple[int, int]]:
@@ -269,31 +297,45 @@ class Manager:
             del self.disk_to_slot[info.disk_id]
         self.slots[key] = SlotInfo()
 
-    def process_disk(self, disk_id: str) -> None:
+    def _claim_disk(self, disk_id: str) -> bool:
+        """Reserve disk for conversion (prevents duplicate workers on same card)."""
         with self.lock:
             if disk_id in self.processing:
-                return
+                return False
             self.processing.add(disk_id)
+            return True
+
+    def _release_disk(self, disk_id: str) -> None:
+        with self.lock:
+            self.processing.discard(disk_id)
+
+    def _enqueue_disk(self, disk_id: str) -> None:
+        if self._claim_disk(disk_id):
+            self.executor.submit(self.process_disk, disk_id)
+
+    def process_disk(self, disk_id: str) -> None:
         key = self.disk_to_slot.get(disk_id)
         if not key:
-            self.processing.discard(disk_id)
+            self._release_disk(disk_id)
             return
         try:
             if is_mbr_formatted(disk_id):
                 self._set_slot(key, SlotStatus.READY, disk_id, "MBR OK")
                 self.log(f"{disk_id}: already MBR - green")
                 return
+
             self._set_slot(key, SlotStatus.PROCESSING, disk_id, "format...")
-            self.log(f"{disk_id}: converting GPT -> MBR...")
+            self.log(f"{disk_id}: parallel convert GPT -> MBR...")
             ok, detail = convert_to_mbr(disk_id)
-            if ok:
+            if ok and is_mbr_formatted(disk_id):
                 self._set_slot(key, SlotStatus.READY, disk_id, "MBR OK")
+                self.failed_attempts.pop(disk_id, None)
                 self.log(f"{disk_id}: MBR SUCCESS - green\n{detail}")
             else:
                 self._set_slot(key, SlotStatus.FAILED, disk_id, "failed")
                 self.log(f"{disk_id}: FAILED\n{detail}")
         finally:
-            self.processing.discard(disk_id)
+            self._release_disk(disk_id)
 
     def poll_loop(self) -> None:
         while self.poll_running:
@@ -333,11 +375,22 @@ class Manager:
                         if disk_id not in present_ids:
                             continue
                         info = self.slots[key]
-                        if info.status == SlotStatus.PENDING and disk_id not in self.processing:
+                        if disk_id in self.processing:
+                            continue
+                        if info.status == SlotStatus.PENDING:
                             to_process.append(disk_id)
+                        elif info.status == SlotStatus.FAILED and not is_mbr_formatted(disk_id):
+                            attempts = self.failed_attempts.get(disk_id, 0)
+                            if attempts < MAX_CONVERT_RETRIES:
+                                self.failed_attempts[disk_id] = attempts + 1
+                                info.status = SlotStatus.PENDING
+                                info.detail = "retry"
+                                to_process.append(disk_id)
 
+                if to_process:
+                    self.log(f"Starting parallel conversion for {len(to_process)} card(s): {', '.join(to_process)}")
                 for disk_id in to_process:
-                    threading.Thread(target=self.process_disk, args=(disk_id,), daemon=True).start()
+                    self._enqueue_disk(disk_id)
             except Exception as exc:
                 self.log(f"Poll error: {exc}")
             time.sleep(POLL_INTERVAL_SEC)
@@ -556,7 +609,8 @@ async function refresh() {{
 
     if (data.host) {{
       const station = data.host.station_id ? 'STATION ' + data.host.station_id : 'STATION --';
-      document.getElementById('station-bar').textContent = station + ' · GPT → MBR AUTO FORMAT';
+      document.getElementById('station-bar').textContent =
+        station + ' · PARALLEL GPT → MBR · max ' + (data.parallel_max || 48) + ' cards';
       document.getElementById('mini-label').textContent =
         data.host.mini_num ? ('MINI ' + data.host.mini_num) : data.host.hostname.toUpperCase();
     }}
@@ -637,6 +691,7 @@ def main() -> None:
         server.serve_forever()
     except KeyboardInterrupt:
         MANAGER.poll_running = False
+        MANAGER.executor.shutdown(wait=False, cancel_futures=True)
         server.shutdown()
 
 
