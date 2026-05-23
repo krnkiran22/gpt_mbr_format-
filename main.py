@@ -150,7 +150,8 @@ textbox.insert("end", "Application started.\n")
 textbox.insert("end", f"Platform: macOS ({sys.platform})\n")
 textbox.insert(
     "end",
-    f"Layout: {HUB_COUNT} hubs × {PORTS_PER_HUB} ports — yellow = needs MBR, green = MBR ready\n",
+    f"Layout: {HUB_COUNT} hubs × {PORTS_PER_HUB} ports — yellow = GPT, green = verified MBR\n",
+    f"Command: diskutil eraseDisk FAT32 SDCARD MBRFormat diskN\n",
 )
 
 # =========================
@@ -270,44 +271,86 @@ def parse_sd_disks(output: str) -> List[DiskInfo]:
     return found
 
 
-def is_mbr_formatted(disk_id: str) -> bool:
-    """True when disk uses Master Boot Record (FDisk) partition scheme."""
+def get_partition_scheme(disk_id: str) -> str:
+    """Return partition scheme string from diskutil, e.g. GUID_partition_scheme."""
+    listing = subprocess.run(
+        ["diskutil", "list", disk_id],
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    for line in listing.splitlines():
+        stripped = line.strip()
+        if re.match(r"^\d+:", stripped):
+            parts = stripped.split()
+            if len(parts) >= 2:
+                return parts[1]
+
     result = subprocess.run(
         ["diskutil", "info", disk_id],
         capture_output=True,
         text=True,
     )
-    text = result.stdout.lower()
-    if "fdisk_partition_scheme" in text:
+    for line in result.stdout.splitlines():
+        if "Content (IOContent):" in line:
+            return line.split(":", 1)[1].strip()
+
+    return "unknown"
+
+
+def is_mbr_formatted(disk_id: str) -> bool:
+    """True when disk uses Master Boot Record (FDisk) and is not GPT."""
+    scheme = get_partition_scheme(disk_id).lower()
+    if "guid_partition_scheme" in scheme:
+        return False
+    if "fdisk_partition_scheme" in scheme:
         return True
-    if "master boot record" in text:
+    if "master boot record" in scheme:
         return True
 
-    listing = subprocess.run(
-        ["diskutil", "list", disk_id],
+    text = subprocess.run(
+        ["diskutil", "info", disk_id],
         capture_output=True,
         text=True,
     ).stdout.lower()
-    return "fdisk_partition_scheme" in listing
+    if "guid_partition_scheme" in text:
+        return False
+    return "fdisk_partition_scheme" in text or "master boot record" in text
 
 
 def convert_to_mbr(disk_id: str) -> Tuple[bool, str]:
-    """Erase disk and apply MBR partition map + FAT32 volume."""
+    """
+    Erase disk with MBR partition map + FAT32 volume.
+
+    Correct macOS syntax:
+      diskutil eraseDisk FAT32 SDCARD MBRFormat diskN
+    (MBRFormat is the partition scheme, not the filesystem format.)
+    """
+    before = get_partition_scheme(disk_id)
+    log_lines = [f"{disk_id}: before = {before}"]
+
     result = subprocess.run(
-        ["diskutil", "eraseDisk", "MBRFormat", "SDCARD", disk_id],
+        ["diskutil", "eraseDisk", "FAT32", "SDCARD", "MBRFormat", disk_id],
         capture_output=True,
         text=True,
     )
     combined = (result.stdout + "\n" + result.stderr).strip()
-    ok = result.returncode == 0 or "finished erase on" in combined.lower()
+    ok = result.returncode == 0 and "finished erase on" in combined.lower()
 
-    if ok and is_mbr_formatted(disk_id):
-        return True, combined
+    if not ok:
+        log_lines.append(combined)
+        return False, "\n".join(log_lines)
 
-    if ok:
-        return False, combined + "\nVerify failed: partition scheme is not MBR."
+    # Re-read after a short pause so diskutil state is stable.
+    time.sleep(0.5)
+    after = get_partition_scheme(disk_id)
+    log_lines.append(f"{disk_id}: after = {after}")
+    log_lines.append(combined)
 
-    return False, combined
+    if is_mbr_formatted(disk_id):
+        return True, "\n".join(log_lines)
+
+    return False, "\n".join(log_lines) + "\nVerify failed: still not MBR."
 
 
 def _next_free_slot() -> Optional[Tuple[int, int]]:
@@ -401,8 +444,8 @@ def process_disk(disk_id: str) -> None:
 
         ok, detail = convert_to_mbr(disk_id)
         if ok:
-            _set_slot(key, SlotStatus.READY, disk_id, disk_id)
-            log(f"{disk_id}: MBR format SUCCESS — green")
+            _set_slot(key, SlotStatus.READY, disk_id, "MBR OK")
+            log(f"{disk_id}: MBR format SUCCESS — green\n{detail}")
         else:
             _set_slot(key, SlotStatus.FAILED, disk_id, "failed")
             log(f"{disk_id}: FAILED\n{detail}")
