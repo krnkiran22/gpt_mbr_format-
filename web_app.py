@@ -112,10 +112,16 @@ def get_disks_output() -> str:
 
 
 def parse_sd_disks(output: str) -> List[DiskInfo]:
+    """Find external ~29 GB SD cards (size is on the partition 0: line)."""
     found: List[DiskInfo] = []
     current_disk: Optional[str] = None
     is_external = False
     scheme = ""
+
+    def _add_disk(size_gb: float) -> None:
+        if current_disk and SD_SIZE_MIN_GB <= size_gb <= SD_SIZE_MAX_GB:
+            if not any(d.disk_id == current_disk for d in found):
+                found.append(DiskInfo(current_disk, size_gb, scheme or "unknown"))
 
     for line in output.splitlines():
         header = re.match(r"/dev/(disk\d+)\s+\(([^)]+)\):", line.strip())
@@ -127,18 +133,21 @@ def parse_sd_disks(output: str) -> List[DiskInfo]:
             continue
         if not current_disk or not is_external or current_disk in SKIP_DISKS:
             continue
+
         stripped = line.strip()
         if re.match(r"^\d+:", stripped):
             parts = stripped.split()
             if len(parts) >= 2:
                 scheme = parts[1]
+            size_gb = _size_gb(stripped)
+            if size_gb is not None:
+                _add_disk(size_gb)
             continue
+
         size_gb = _size_gb(line)
-        if size_gb is None:
-            continue
-        if SD_SIZE_MIN_GB <= size_gb <= SD_SIZE_MAX_GB:
-            if not any(d.disk_id == current_disk for d in found):
-                found.append(DiskInfo(current_disk, size_gb, scheme or "unknown"))
+        if size_gb is not None:
+            _add_disk(size_gb)
+
     return found
 
 

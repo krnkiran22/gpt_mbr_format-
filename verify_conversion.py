@@ -30,6 +30,11 @@ def parse_sd_disks(output: str):
     is_external = False
     scheme = ""
 
+    def _add_disk(size_gb):
+        if current_disk and SD_SIZE_MIN_GB <= size_gb <= SD_SIZE_MAX_GB:
+            if not any(d["disk_id"] == current_disk for d in found):
+                found.append({"disk_id": current_disk, "size_gb": size_gb, "scheme": scheme or "unknown"})
+
     for line in output.splitlines():
         header = re.match(r"/dev/(disk\d+)\s+\(([^)]+)\):", line.strip())
         if header:
@@ -45,13 +50,13 @@ def parse_sd_disks(output: str):
             parts = stripped.split()
             if len(parts) >= 2:
                 scheme = parts[1]
+            size_gb = _size_gb(stripped)
+            if size_gb is not None:
+                _add_disk(size_gb)
             continue
         size_gb = _size_gb(line)
-        if size_gb is None:
-            continue
-        if SD_SIZE_MIN_GB <= size_gb <= SD_SIZE_MAX_GB:
-            if not any(d["disk_id"] == current_disk for d in found):
-                found.append({"disk_id": current_disk, "size_gb": size_gb, "scheme": scheme or "unknown"})
+        if size_gb is not None:
+            _add_disk(size_gb)
 
     return found
 
